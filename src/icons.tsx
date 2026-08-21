@@ -7,7 +7,9 @@ import {
   DeviceMobile, DotsThreeVertical, DownloadSimple, EnvelopeSimple, Eye as EyeIcon, EyeSlash, FileText as FileTextIcon,
   Gear, Hash as HashIcon, Image as ImageIcon, Key, LockKey, MagnifyingGlass, MapPin as MapPinIcon,
   Microphone, Moon as MoonIcon, Palette as PaletteIcon, PaperPlaneTilt, Paperclip as PaperclipIcon,
-  Pause as PauseIcon, PencilSimple, Phone as PhoneIcon, PhoneCall as PhoneCallIcon, Play as PlayIcon,
+  Pause as PauseIcon, PencilSimple, Phone as PhoneIcon, PhoneCall as PhoneCallIcon,
+  PhoneIncoming as PhoneIncomingIcon, PhoneOutgoing as PhoneOutgoingIcon, PhoneX as PhoneXIcon,
+  ClockCounterClockwise, BellRinging, Play as PlayIcon,
   Plus as PlusIcon, PlusCircle, PushPin, ShieldCheck as ShieldCheckIcon,
   SidebarSimple, SignOut, Smiley, Sparkle, SpinnerGap, Star as StarIcon, Sticker as StickerIcon,
   Sun as SunIcon, Trash as TrashIcon, UploadSimple, UserCircle, UserPlus as UserPlusIcon, UsersThree,
@@ -21,3 +23,4 @@ export const Check=modern(CheckIcon,'bold'), Search=modern(MagnifyingGlass), Mor
 export const ArrowLeft=modern(ArrowLeftIcon,'bold'), Eye=modern(EyeIcon), EyeOff=modern(EyeSlash), KeyRound=modern(Key), LoaderCircle=modern(SpinnerGap), Mail=modern(EnvelopeSimple), UserRound=modern(UserCircle)
 export const BarChart3=modern(ChartBar), Copy=modern(CopyIcon), FileUp=modern(UploadSimple), Forward=modern(ArrowBendUpRight), Pencil=modern(PencilSimple), Paperclip=modern(PaperclipIcon), Pause=modern(PauseIcon,'fill'), RefreshCw=modern(ArrowsClockwise), Reply=modern(ArrowUUpLeft), Settings=modern(Gear), Star=modern(StarIcon), Sticker=modern(StickerIcon), Trash2=modern(TrashIcon)
 export const CalendarClock=modern(CalendarBlank), Clock3=modern(Clock), Crop=modern(CropIcon), Edit3=modern(PencilSimple), LogOut=modern(SignOut), Smartphone=modern(DeviceMobile), UserPlus=modern(UserPlusIcon), RotateCw=modern(ArrowClockwise)
+export const PhoneIncoming=modern(PhoneIncomingIcon), PhoneOutgoing=modern(PhoneOutgoingIcon), PhoneMissed=modern(PhoneXIcon), CallHistory=modern(ClockCounterClockwise), BellAlert=modern(BellRinging)
