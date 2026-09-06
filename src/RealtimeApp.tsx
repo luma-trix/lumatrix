@@ -1,0 +1,397 @@
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
+import type { RealtimeChannel, Session } from '@supabase/supabase-js'
+import { Archive, BarChart3, BellAlert, BellOff, Caffeine, Camera, CheckCheck, ChevronLeft, CirclePlus, Copy, FileUp, Forward, Hash, LoaderCircle, LockKeyhole, MapPin, MessageCircle, Mic, Moon, MoreVertical, Paperclip, Pause, Pencil, Phone, PhoneIncoming, PhoneOutgoing, PhoneMissed, Pin, Play, Radio, RefreshCw, Reply, Search, Send, Settings, ShieldCheck, Smile, Star, Sticker, Sun, Trash2, UserPlus, Users, Video, X } from './icons'
+import { LumaMark } from './Brand'
+import { supabase } from './lib/supabase'
+import { ChatInfoPanel, EmojiPicker, GroupModal, MediaEditor, MediaMessage, PollMessage, SettingsPanel, UpdatesPanel } from './RealtimeFeatures'
+import './realtime.css'
+
+const LiveKitConference=lazy(()=>import('./LiveKitConference'))
+const Paywall=lazy(()=>import('./Paywall'))
+const PAYWALL_ENABLED=import.meta.env.VITE_PAYWALL_ENABLED==='1'
+// Inaudible 250 ms loop (8 kHz mono WAV). While it plays, iOS/Android keep the
+// page — and its Supabase Realtime socket — alive in the background, so incoming
+// messages can still arrive and raise a notification. Opt-in via "Keep Luma awake".
+const SILENT_LOOP='data:audio/wav;base64,UklGRvQHAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YdAHAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=='
+
+export type Profile={id:string;username:string;display_name:string;avatar_url:string|null;bio:string;last_seen:string}
+export type Conversation={id:string;kind:'direct'|'group'|'channel'|'saved';title:string|null;description:string|null;avatar_url:string|null;created_by:string;updated_at:string;disappearing_seconds?:number|null;members?:Profile[];last?:Message;memberInfo?:{pinned:boolean;archived:boolean;last_read_at:string;muted_until?:string|null}}
+export type Message={id:string;conversation_id:string;sender_id:string;kind:string;body:string;metadata:Record<string,unknown>;created_at:string;reply_to?:string|null;edited_at?:string|null}
+export type CallRecord={id:string;conversation_id:string;started_by:string;kind:'voice'|'video';state:string;started_at:string;answered_at:string|null;ended_at:string|null}
+type IncomingCall={id:string;conversation_id:string;started_by:string;kind:'voice'|'video'}
+type Conference={id:string;room:string;kind:'voice'|'video';title:string;createdBy?:string;openInvite?:boolean}
+
+const initials=(name:string)=>name.split(/\s+/).map(x=>x[0]).join('').slice(0,2).toUpperCase()
+const time=(d:string)=>new Date(d).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})
+
+export default function RealtimeApp({session}:{session:Session}){
+ const me=session.user.id
+ const [profile,setProfile]=useState<Profile|null>(null),[conversations,setConversations]=useState<Conversation[]>([]),[activeId,setActiveId]=useState<string|null>(null)
+ const [messages,setMessages]=useState<Message[]>([]),[draft,setDraft]=useState(''),[loading,setLoading]=useState(true),[sending,setSending]=useState(false)
+ const [section,setSection]=useState<'chats'|'updates'|'groups'|'calls'>('chats'),[filter,setFilter]=useState<'all'|'unread'|'archived'>('all')
+ const [callLog,setCallLog]=useState<CallRecord[]>([]),[callsLoading,setCallsLoading]=useState(false)
+ const [paywall,setPaywall]=useState(false),[subscribed,setSubscribed]=useState(false)
+ const [notifyOn,setNotifyOn]=useState(()=>localStorage.getItem('luma-notify')==='1'&&typeof Notification!=='undefined'&&Notification.permission==='granted')
+ const [msgHits,setMsgHits]=useState<Message[]>([]),[msgSearching,setMsgSearching]=useState(false),[highlightId,setHighlightId]=useState<string|null>(null)
+ const [query,setQuery]=useState(''),[dark,setDark]=useState(false),[mobileChat,setMobileChat]=useState(false),[newChat,setNewChat]=useState(false)
+ const [settings,setSettings]=useState(false),[chatInfo,setChatInfo]=useState(false),[groupModal,setGroupModal]=useState(false),[pollModal,setPollModal]=useState(false),[attachMenu,setAttachMenu]=useState(false),[mediaFile,setMediaFile]=useState<File|null>(null),[emoji,setEmoji]=useState(false),[stickers,setStickers]=useState(false),[recording,setRecording]=useState(false),[recordPaused,setRecordPaused]=useState(false),[recordSeconds,setRecordSeconds]=useState(0)
+ const [chatSearch,setChatSearch]=useState(false),[chatQuery,setChatQuery]=useState(''),[messageMenu,setMessageMenu]=useState<Message|null>(null),[replying,setReplying]=useState<Message|null>(null),[editing,setEditing]=useState<Message|null>(null),[forwarding,setForwarding]=useState<Message|null>(null),[reactions,setReactions]=useState<Record<string,{emoji:string;user_id:string}[]>>({}),[chatAction,setChatAction]=useState<Conversation|null>(null),[wallpaper,setWallpaper]=useState(()=>localStorage.getItem('nexa-wallpaper')||''),[fontSize,setFontSize]=useState(()=>localStorage.getItem('nexa-font-size')||'medium'),[fontFamily,setFontFamily]=useState(()=>localStorage.getItem('nexa-font-family')||'modern'),[theme,setTheme]=useState(()=>{if(localStorage.getItem('luma-brand-v1')!=='1'){localStorage.setItem('luma-brand-v1','1');localStorage.setItem('nexa-theme','luma')}return localStorage.getItem('nexa-theme')||'luma'})
+ const [people,setPeople]=useState<Profile[]>([]),[peopleQuery,setPeopleQuery]=useState(''),[searching,setSearching]=useState(false),[typing,setTyping]=useState<string[]>([])
+ const [startingChat,setStartingChat]=useState<string|null>(null),[notice,setNotice]=useState<string|null>(null)
+ const [incoming,setIncoming]=useState<IncomingCall|null>(null),[incomingConference,setIncomingConference]=useState<Conference|null>(null),[call,setCall]=useState<{id:string;kind:'voice'|'video';peer:Profile;incoming:boolean}|null>(null),[conference,setConference]=useState<Conference|null>(null)
+ const [soundsOn,setSoundsOn]=useState(()=>localStorage.getItem('luma-sounds')!=='0')
+ const [awake,setAwake]=useState(()=>localStorage.getItem('luma-awake')==='1')
+ const unreadRef=useRef<Set<string>>(new Set())
+ const audioRef=useRef<HTMLAudioElement|null>(null),audioCtxRef=useRef<AudioContext|null>(null)
+ const endRef=useRef<HTMLDivElement>(null), typingChannel=useRef<RealtimeChannel|null>(null),fileInput=useRef<HTMLInputElement>(null),videoInput=useRef<HTMLInputElement>(null),recorder=useRef<MediaRecorder|null>(null),recordChunks=useRef<Blob[]>([]),recordStarted=useRef(0),pausedTotal=useRef(0),pauseStarted=useRef(0),swipeStart=useRef<{x:number;y:number}|null>(null),chatGesture=useRef<{x:number;y:number;chat:Conversation}|null>(null),msgSwipe=useRef<{x:number;y:number;id:string}|null>(null),chatHold=useRef<ReturnType<typeof setTimeout>|null>(null),suppressChatClick=useRef(false)
+ const active=conversations.find(c=>c.id===activeId)||null
+
+ useEffect(()=>{void bootstrap()},[])
+ // Unlock WebAudio on the first user gesture so the incoming-message chime can
+ // play on iOS/Android without further taps.
+ useEffect(()=>{
+  const unlock=()=>{try{const Ctx=window.AudioContext||(window as unknown as {webkitAudioContext?:typeof AudioContext}).webkitAudioContext;if(Ctx){if(!audioCtxRef.current)audioCtxRef.current=new Ctx();if(audioCtxRef.current.state==='suspended')void audioCtxRef.current.resume()}}catch{/* ignore */}}
+  window.addEventListener('pointerdown',unlock,{once:true})
+  window.addEventListener('keydown',unlock,{once:true})
+  return()=>{window.removeEventListener('pointerdown',unlock);window.removeEventListener('keydown',unlock)}
+ },[])
+ // Stop the keep-awake loop if the component unmounts.
+ useEffect(()=>()=>{try{audioRef.current?.pause()}catch{/* ignore */}},[])
+ useEffect(()=>{
+  if(!PAYWALL_ENABLED){setSubscribed(true);return}
+  void refreshSubscription()
+ },[me])
+ useEffect(()=>{if(section==='calls')void loadCalls()},[section])
+ useEffect(()=>{
+  if(!highlightId)return
+  const el=document.getElementById(`msg-${highlightId}`)
+  if(el)el.scrollIntoView({behavior:'smooth',block:'center'})
+  const t=setTimeout(()=>setHighlightId(null),2600)
+  return()=>clearTimeout(t)
+ },[highlightId,messages])
+ useEffect(()=>{
+  const params=new URLSearchParams(window.location.search)
+  const wanted=params.get('section'),action=params.get('action')
+  if(wanted==='calls')setSection('calls')
+  else if(wanted==='updates')setSection('updates')
+  else if(wanted==='groups')setSection('groups')
+  if(action==='new-chat')setNewChat(true)
+  const payment=params.get('payment')
+  if(payment==='complete'&&PAYWALL_ENABLED){
+   setNotice('Confirming your payment…')
+   void(async()=>{
+    // The webhook is the source of truth and may land a moment after the redirect.
+    for(let attempt=0;attempt<6;attempt++){
+     if(await refreshSubscription()){setNotice('Subscription active — video calls unlocked');return}
+     await new Promise(r=>setTimeout(r,2500))
+    }
+    setNotice('Payment received. If video calls stay locked, reopen the app in a minute.')
+   })()
+  }
+  if(wanted||action||payment)window.history.replaceState({},'',window.location.pathname)
+ },[])
+ useEffect(()=>{
+  const q=query.trim()
+  if(section==='updates'||section==='calls'||q.length<2){setMsgHits([]);setMsgSearching(false);return}
+  let cancelled=false
+  setMsgSearching(true)
+  const timer=setTimeout(async()=>{
+   const escaped=q.replace(/[%_]/g,c=>'\\'+c)
+   const {data}=await supabase.from('messages').select('*').ilike('body',`%${escaped}%`).order('created_at',{ascending:false}).limit(25)
+   if(cancelled)return
+   setMsgHits((data||[]) as Message[]);setMsgSearching(false)
+  },320)
+  return()=>{cancelled=true;clearTimeout(timer);}
+ },[query,section])
+ useEffect(()=>{const update=()=>setWallpaper((activeId&&localStorage.getItem(`nexa-wallpaper:${activeId}`))||localStorage.getItem('nexa-wallpaper')||'');update();window.addEventListener('nexa-wallpaper-change',update);return()=>window.removeEventListener('nexa-wallpaper-change',update)},[activeId])
+ useEffect(()=>{const update=()=>{setFontSize(localStorage.getItem('nexa-font-size')||'medium');setFontFamily(localStorage.getItem('nexa-font-family')||'modern');setTheme(localStorage.getItem('nexa-theme')||'luma')};window.addEventListener('nexa-display-change',update);return()=>window.removeEventListener('nexa-display-change',update)},[])
+ useEffect(()=>{const ch=supabase.channel(`membership:${me}`).on('postgres_changes',{event:'INSERT',schema:'public',table:'conversation_members',filter:`user_id=eq.${me}`},()=>void loadConversations()).on('postgres_changes',{event:'DELETE',schema:'public',table:'conversation_members',filter:`user_id=eq.${me}`},()=>void loadConversations()).subscribe();return()=>{void supabase.removeChannel(ch)}},[me])
+ useEffect(()=>{const ch=supabase.channel(`chat-list:${me}`).on('postgres_changes',{event:'INSERT',schema:'public',table:'messages'},p=>{const msg=p.new as Message;setConversations(cs=>cs.map(c=>c.id===msg.conversation_id?{...c,last:msg,updated_at:msg.created_at}:c).sort((a,b)=>b.updated_at.localeCompare(a.updated_at)));notifyMessage(msg)}).subscribe();return()=>{void supabase.removeChannel(ch)}},[me])
+ useEffect(()=>{if(!activeId)return; void loadMessages(activeId); const ch=supabase.channel(`messages:${activeId}`).on('postgres_changes',{event:'INSERT',schema:'public',table:'messages',filter:`conversation_id=eq.${activeId}`},p=>setMessages(m=>m.some(x=>x.id===(p.new as Message).id)?m:[...m,p.new as Message])).on('postgres_changes',{event:'UPDATE',schema:'public',table:'messages',filter:`conversation_id=eq.${activeId}`},p=>setMessages(m=>m.map(x=>x.id===(p.new as Message).id?p.new as Message:x))).on('postgres_changes',{event:'DELETE',schema:'public',table:'messages',filter:`conversation_id=eq.${activeId}`},p=>setMessages(m=>m.filter(x=>x.id!==(p.old as Message).id))).subscribe(); return()=>{void supabase.removeChannel(ch)}},[activeId])
+ useEffect(()=>{endRef.current?.scrollIntoView({behavior:'smooth'})},[messages])
+ useEffect(()=>{if(activeId)setDraft(localStorage.getItem(`nexa-draft:${activeId}`)||'')},[activeId])
+ useEffect(()=>{if(activeId&&!editing)localStorage.setItem(`nexa-draft:${activeId}`,draft)},[activeId,draft,editing])
+ useEffect(()=>{if(!activeId)return;const ch=supabase.channel(`reactions:${activeId}`).on('postgres_changes',{event:'*',schema:'public',table:'message_reactions'},()=>void loadMessages(activeId)).subscribe();return()=>{void supabase.removeChannel(ch)}},[activeId])
+ useEffect(()=>{const ch=supabase.channel(`calls:${me}`).on('postgres_changes',{event:'INSERT',schema:'public',table:'call_sessions'},async p=>{const c=p.new as IncomingCall;if(c.started_by===me)return;const {data}=await supabase.from('conversation_members').select('conversation_id').eq('conversation_id',c.conversation_id).eq('user_id',me).maybeSingle();if(data)setIncoming(c)}).subscribe();return()=>{void supabase.removeChannel(ch)}},[me])
+ useEffect(()=>{const ch=supabase.channel(`conference-invites:${me}`).on('postgres_changes',{event:'INSERT',schema:'public',table:'conference_participants',filter:`user_id=eq.${me}`},async p=>{const invite=p.new as {room_id:string;user_id:string;invited_by:string};if(invite.invited_by===me)return;const {data}=await supabase.from('conference_rooms').select('*').eq('id',invite.room_id).eq('active',true).gt('expires_at',new Date().toISOString()).maybeSingle();if(data)setIncomingConference({id:data.id,room:data.room_code,kind:data.kind,title:data.title,createdBy:data.created_by})}).subscribe();return()=>{void supabase.removeChannel(ch)}},[me])
+ useEffect(()=>{if(!activeId)return;const ch=supabase.channel(`typing:${activeId}`,{config:{presence:{key:me}}});typingChannel.current=ch;ch.on('presence',{event:'sync'},()=>{const state=ch.presenceState() as Record<string,{user_id?:string;name?:string;typing?:boolean}[]>;setTyping(Object.values(state).flat().filter(x=>x.user_id!==me&&x.typing).map(x=>x.name||'Someone'))}).subscribe(async s=>{if(s==='SUBSCRIBED')await ch.track({user_id:me,name:profile?.display_name||'Someone',typing:false})});return()=>{typingChannel.current=null;void supabase.removeChannel(ch)}},[activeId,me,profile?.display_name])
+ useEffect(()=>{if(!recording)return;const id=setInterval(()=>{const currentPause=recordPaused?Date.now()-pauseStarted.current:0;setRecordSeconds(Math.max(0,Math.floor((Date.now()-recordStarted.current-pausedTotal.current-currentPause)/1000)))},500);return()=>clearInterval(id)},[recording,recordPaused])
+
+ async function bootstrap(){
+  setLoading(true)
+  const [{data:p},{data:contacts}]=await Promise.all([supabase.from('profiles').select('*').eq('id',me).single(),supabase.from('profiles').select('*').neq('id',me).limit(50)]);setProfile(p);setPeople((contacts||[]) as Profile[])
+  await loadConversations();const {data:pending}=await supabase.from('conference_participants').select('room_id,joined_at,dismissed_at,conference_rooms(*)').eq('user_id',me).is('joined_at',null).is('dismissed_at',null).order('invited_at',{ascending:false}).limit(1).maybeSingle();const room=(pending as any)?.conference_rooms;if(room?.active&&new Date(room.expires_at)>new Date())setIncomingConference({id:room.id,room:room.room_code,kind:room.kind,title:room.title,createdBy:room.created_by});setLoading(false)
+ }
+ async function loadConversations(){
+  const {data:mine,error}=await supabase.from('conversation_members').select('conversation_id,pinned,archived,last_read_at,muted_until,cleared_at').eq('user_id',me)
+  if(error||!mine?.length){setConversations([]);return}
+  const ids=mine.map(x=>x.conversation_id)
+  const [{data:cs},{data:members},{data:lastMessages}]=await Promise.all([
+   supabase.from('conversations').select('*').in('id',ids).order('updated_at',{ascending:false}),
+   supabase.from('conversation_members').select('conversation_id,profiles(*)').in('conversation_id',ids),
+   supabase.from('messages').select('*').in('conversation_id',ids).order('created_at',{ascending:false}).limit(150)
+  ])
+  const result=(cs||[]).map(c=>({...c,members:(members||[]).filter((m:any)=>m.conversation_id===c.id).map((m:any)=>m.profiles).filter(Boolean),last:(lastMessages||[]).find(m=>m.conversation_id===c.id),memberInfo:mine.find(x=>x.conversation_id===c.id)})) as Conversation[]
+  result.sort((a,b)=>Number(Boolean(b.memberInfo?.pinned))-Number(Boolean(a.memberInfo?.pinned))||b.updated_at.localeCompare(a.updated_at));setConversations(result);if(!activeId&&result[0])setActiveId(result[0].id)
+ }
+ async function loadMessages(id:string){const {data}=await supabase.from('messages').select('*').eq('conversation_id',id).order('created_at');const list=(data||[]) as Message[];setMessages(list);if(list.length){const {data:r}=await supabase.from('message_reactions').select('message_id,user_id,emoji').in('message_id',list.map(m=>m.id));const grouped:Record<string,{emoji:string;user_id:string}[]>={};for(const x of r||[])(grouped[x.message_id]??=[]).push(x);setReactions(grouped)}else setReactions({})}
+ function title(c:Conversation){if(c.kind!=='direct')return c.title||'Untitled';return c.members?.find(p=>p.id!==me)?.display_name||'Direct chat'}
+ function peer(c:Conversation){return c.members?.find(p=>p.id!==me)||profile!}
+ async function send(){if(!activeId||!draft.trim()||sending)return;setSending(true);const body=draft.trim();setDraft('');let error;if(editing){const result=await supabase.from('messages').update({body,edited_at:new Date().toISOString()}).eq('id',editing.id);error=result.error;if(!error)setMessages(ms=>ms.map(m=>m.id===editing.id?{...m,body}:m))}else{const result=await supabase.from('messages').insert({conversation_id:activeId,sender_id:me,body,kind:'text',reply_to:replying?.id||null});error=result.error}if(error)setDraft(body);else{setEditing(null);setReplying(null);await supabase.from('conversations').update({updated_at:new Date().toISOString()}).eq('id',activeId);void typingChannel.current?.track({user_id:me,name:profile?.display_name,typing:false})}setSending(false)}
+ async function searchPeople(value:string){setPeopleQuery(value);if(value.trim().length<2){setPeople([]);return}setSearching(true);const {data}=await supabase.from('profiles').select('*').neq('id',me).or(`username.ilike.%${value.trim()}%,display_name.ilike.%${value.trim()}%`).limit(20);setPeople((data||[]) as Profile[]);setSearching(false)}
+ async function startDirect(other:Profile){
+  if(startingChat)return
+  const existing=conversations.find(c=>c.kind==='direct'&&c.members?.some(p=>p.id===other.id));if(existing){setActiveId(existing.id);setNewChat(false);setMobileChat(true);return}
+  setStartingChat(other.id);setNotice(null)
+  try{
+   const id=crypto.randomUUID()
+   const created=await supabase.from('conversations').insert({id,kind:'direct',created_by:me});if(created.error)throw created.error
+   const own=await supabase.from('conversation_members').insert({conversation_id:id,user_id:me,role:'owner'});if(own.error)throw own.error
+   const joined=await supabase.from('conversation_members').insert({conversation_id:id,user_id:other.id,role:'member'});if(joined.error)throw joined.error
+   await loadConversations();setActiveId(id);setNewChat(false);setMobileChat(true)
+  }catch(error){setNotice(error instanceof Error?error.message:'The conversation could not be created. Please try again.')}
+  finally{setStartingChat(null)}
+ }
+ async function loadCalls(){
+  setCallsLoading(true)
+  const {data,error}=await supabase.from('call_sessions').select('id,conversation_id,started_by,kind,state,started_at,answered_at,ended_at').order('started_at',{ascending:false}).limit(120)
+  if(error)setNotice('Could not load call history')
+  setCallLog((data||[]) as CallRecord[]);setCallsLoading(false)
+ }
+ async function callConversation(c:Conversation,kind:'voice'|'video'){
+  setActiveId(c.id);setSection('chats')
+  if(c.kind!=='direct'){setMobileChat(true);setNotice('Open the group to start a conference');return}
+  if(kind==='video'&&PAYWALL_ENABLED&&!subscribed){setPaywall(true);return}
+  const p=c.members?.find(x=>x.id!==me)||profile
+  if(!p){setNotice('Could not find that contact');return}
+  const id=crypto.randomUUID()
+  const {error}=await supabase.from('call_sessions').insert({id,conversation_id:c.id,started_by:me,kind,state:'ringing'})
+  if(error){await handleCallError(error,kind);return}
+  setCall({id,kind,peer:p,incoming:false})
+ }
+ function playChime(){
+  if(!soundsOn)return
+  try{
+   const Ctx=window.AudioContext||(window as unknown as {webkitAudioContext?:typeof AudioContext}).webkitAudioContext
+   if(!Ctx)return
+   if(!audioCtxRef.current)audioCtxRef.current=new Ctx()
+   const ctx=audioCtxRef.current
+   if(ctx.state==='suspended')void ctx.resume()
+   const t0=ctx.currentTime
+   ;[880,1174.66].forEach((f,i)=>{const o=ctx.createOscillator(),g=ctx.createGain();o.type='sine';o.frequency.value=f;const t=t0+i*0.1;g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(0.14,t+0.025);g.gain.exponentialRampToValueAtTime(0.0001,t+0.32);o.connect(g);g.connect(ctx.destination);o.start(t);o.stop(t+0.35)})
+  }catch{/* audio unavailable */}
+ }
+ function toggleAwake(){
+  const next=!awake
+  localStorage.setItem('luma-awake',next?'1':'0')
+  if(next){
+   try{
+    const a=new Audio(SILENT_LOOP)
+    a.loop=true
+    void a.play().catch(()=>setNotice('Tap "Keep Luma awake" again to allow background sound'))
+    audioRef.current=a
+    setNotice('Luma now works in the background. Keep it in your apps list — do not swipe it away.')
+   }catch{setNotice('This device could not start background audio')}
+  }else{
+   try{audioRef.current?.pause()}catch{/* already stopped */}
+   audioRef.current=null
+   setNotice('Keep awake turned off')
+  }
+  setAwake(next)
+ }
+ function notifyMessage(msg:Message){
+  if(msg.sender_id===me)return
+  const hidden=typeof document!=='undefined'&&document.visibilityState!=='visible'
+  const notActive=msg.conversation_id!==activeId
+  if(!hidden&&!notActive)return
+  const conv=conversations.find(c=>c.id===msg.conversation_id)
+  if(conv?.memberInfo?.muted_until&&new Date(conv.memberInfo.muted_until)>new Date())return
+  const from=conv?title(conv):'New message'
+  const preview=['voice','image','video','audio','file'].includes(msg.kind)?`Sent ${msg.kind==='voice'?'a voice message':`a ${msg.kind}`}`:(msg.body||'New message').slice(0,120)
+  playChime()
+  if(notifyOn&&typeof Notification!=='undefined'&&Notification.permission==='granted'&&hidden){
+   try{
+    const n=new Notification(from,{body:preview,tag:msg.conversation_id,icon:`${import.meta.env.BASE_URL}icons/icon-192.png`,badge:`${import.meta.env.BASE_URL}icons/icon-192.png`})
+    n.onclick=()=>{window.focus();setSection('chats');void openConversation(msg.conversation_id);n.close()}
+   }catch{/* notification construction can fail on some platforms */}
+  }
+  unreadRef.current.add(msg.conversation_id);setBadge(unreadRef.current.size)
+ }
+ async function handleCallError(error:{code?:string;message?:string},kind:'voice'|'video'){
+  // Postgres 42501 = insufficient_privilege, i.e. an RLS policy refused the insert.
+  const blocked=error?.code==='42501'||/row-level security|violates row-level/i.test(error?.message||'')
+  if(kind==='video'&&blocked){
+   // Confirm with the server rather than trusting local state, then explain.
+   const active=await refreshSubscription()
+   if(active)setNotice('Your subscription is active but the call was refused. Please try again.')
+   else setPaywall(true)
+   return
+  }
+  setNotice(blocked?'You do not have permission to start this call':'Could not start the call')
+ }
+ async function refreshSubscription(){
+  const {data}=await supabase.from('subscriptions').select('status,current_period_end').eq('user_id',me).maybeSingle()
+  const active=data?.status==='active'&&(!data.current_period_end||new Date(data.current_period_end)>new Date())
+  setSubscribed(Boolean(active))
+  return Boolean(active)
+ }
+ async function enableNotifications(){
+  if(typeof Notification==='undefined'){setNotice('This browser does not support notifications');return}
+  if(Notification.permission==='denied'){setNotice('Notifications are blocked in your browser settings');return}
+  const res=Notification.permission==='granted'?'granted':await Notification.requestPermission()
+  if(res==='granted'){localStorage.setItem('luma-notify','1');setNotifyOn(true);setNotice('Notifications enabled')}
+  else setNotice('Notifications were not enabled')
+ }
+ function disableNotifications(){localStorage.setItem('luma-notify','0');setNotifyOn(false);clearBadge()}
+ function clearBadge(){const n=navigator as Navigator&{clearAppBadge?:()=>Promise<void>};void n.clearAppBadge?.()}
+ function setBadge(count:number){
+  const n=navigator as Navigator&{setAppBadge?:(c?:number)=>Promise<void>;clearAppBadge?:()=>Promise<void>}
+  if(count>0)void n.setAppBadge?.(count);else void n.clearAppBadge?.()
+  document.title=count>0?`(${count}) Luma`:'Luma'
+ }
+ async function jumpToMessage(hit:Message){
+  setSection('chats');setQuery('')
+  await openConversation(hit.conversation_id)
+  setHighlightId(hit.id)
+ }
+ async function openConversation(id:string){setActiveId(id);setMobileChat(true);setEmoji(false);unreadRef.current.delete(id);setBadge(unreadRef.current.size);await supabase.from('conversation_members').update({last_read_at:new Date().toISOString()}).eq('conversation_id',id).eq('user_id',me);setConversations(cs=>cs.map(c=>c.id===id&&c.memberInfo?{...c,memberInfo:{...c.memberInfo,last_read_at:new Date().toISOString()}}:c))}
+ async function uploadMedia(file:File|Blob,kind:'image'|'voice'|'video'|'audio'|'file',duration?:number,caption='',displayName?:string){
+  if(!activeId)return;setSending(true);const mime=file.type||'application/octet-stream';const mimeExt=mime.includes('mp4')?'mp4':mime.includes('aac')?'aac':mime.includes('ogg')?'ogg':mime.includes('webm')?'webm':'';const ext=displayName?.split('.').pop()||(file as File).name?.split('.').pop()||mimeExt||(kind==='image'?'jpg':kind==='video'?'mp4':'bin');const path=`${activeId}/${me}/${crypto.randomUUID()}.${ext}`;const {error}=await supabase.storage.from('chat-media').upload(path,file,{contentType:mime,upsert:false});if(error){setNotice(error.message);setSending(false);return}const body=caption||displayName||(kind==='voice'?'Voice message':(file as File).name||kind);const sent=await supabase.from('messages').insert({conversation_id:activeId,sender_id:me,kind,body,metadata:{path,name:displayName||(file as File).name,duration:duration?`${duration}s`:undefined,mime,size:file.size,caption}});if(sent.error)setNotice(sent.error.message);setSending(false)
+ }
+ function chooseFile(file?:File){if(!file)return;if(file.size>50*1024*1024){setNotice('Files must be 50 MB or smaller.');return}setMediaFile(file);setAttachMenu(false)}
+ async function toggleRecording(){
+  if(recording){recorder.current?.stop();setRecording(false);return}
+  try{const stream=await navigator.mediaDevices.getUserMedia({audio:true});const preferred=MediaRecorder.isTypeSupported('audio/mp4')?'audio/mp4':MediaRecorder.isTypeSupported('audio/webm')?'audio/webm':'';const r=new MediaRecorder(stream,preferred?{mimeType:preferred}:undefined);recordChunks.current=[];recordStarted.current=Date.now();pausedTotal.current=0;setRecordPaused(false);r.ondataavailable=e=>{if(e.data.size)recordChunks.current.push(e.data)};r.onstop=()=>{stream.getTracks().forEach(t=>t.stop());if(pauseStarted.current)pausedTotal.current+=Date.now()-pauseStarted.current;const seconds=Math.max(1,Math.round((Date.now()-recordStarted.current-pausedTotal.current)/1000));void uploadMedia(new Blob(recordChunks.current,{type:r.mimeType||preferred||'audio/webm'}),'voice',seconds);setRecordSeconds(0);setRecordPaused(false)};r.start(500);recorder.current=r;setRecording(true);setRecordSeconds(0)}catch{setNotice('Microphone access was denied. Allow microphone permission in your browser settings.')}
+ }
+ function pauseRecording(){const r=recorder.current;if(!r)return;if(r.state==='recording'){r.pause();pauseStarted.current=Date.now();setRecordPaused(true)}else if(r.state==='paused'){r.resume();pausedTotal.current+=Date.now()-pauseStarted.current;pauseStarted.current=0;setRecordPaused(false)}}
+ function handleTouchStart(e:React.TouchEvent){const t=e.touches[0];swipeStart.current={x:t.clientX,y:t.clientY}}
+ function handleTouchEnd(e:React.TouchEvent){if(!swipeStart.current)return;const t=e.changedTouches[0],dx=t.clientX-swipeStart.current.x,dy=Math.abs(t.clientY-swipeStart.current.y);if(dx>85&&dy<70){if(messageMenu)setMessageMenu(null);else if(chatInfo)setChatInfo(false);else if(groupModal)setGroupModal(false);else if(newChat)setNewChat(false);else if(settings)setSettings(false);else if(mobileChat)setMobileChat(false)}swipeStart.current=null}
+ async function toggleArchive(){if(!activeId||!active)return;const archived=!active.memberInfo?.archived;const {error}=await supabase.from('conversation_members').update({archived}).eq('conversation_id',activeId).eq('user_id',me);if(error)setNotice(error.message);else{setConversations(cs=>cs.map(c=>c.id===activeId&&c.memberInfo?{...c,memberInfo:{...c.memberInfo,archived}}:c));setMobileChat(false)}}
+ async function sendSticker(stickerValue:string){if(!activeId)return;setStickers(false);if(stickerValue.startsWith('data:')){setSending(true);const blob=await fetch(stickerValue).then(r=>r.blob());const ext=blob.type.includes('png')?'png':blob.type.includes('webp')?'webp':'jpg',path=`${activeId}/${me}/${crypto.randomUUID()}.${ext}`;const up=await supabase.storage.from('chat-media').upload(path,blob,{contentType:blob.type});if(up.error){setNotice(up.error.message);setSending(false);return}const sent=await supabase.from('messages').insert({conversation_id:activeId,sender_id:me,kind:'image',body:'Sticker',metadata:{sticker:true,path}});if(sent.error)setNotice(sent.error.message);setSending(false);return}const {error}=await supabase.from('messages').insert({conversation_id:activeId,sender_id:me,kind:'text',body:stickerValue,metadata:{sticker:true}});if(error)setNotice(error.message)}
+ async function deleteMessageForMe(message:Message){const {error}=await supabase.from('message_hidden').insert({user_id:me,message_id:message.id});if(error)setNotice(error.message);else setMessages(ms=>ms.filter(m=>m.id!==message.id));setMessageMenu(null)}
+ async function deleteMessageForAll(message:Message){if(message.sender_id!==me)return;const {error}=await supabase.from('messages').delete().eq('id',message.id);if(error)setNotice(error.message);else setMessages(ms=>ms.filter(m=>m.id!==message.id));setMessageMenu(null)}
+ async function reactTo(message:Message,emojiValue:string){const existing=reactions[message.id]?.find(r=>r.user_id===me&&r.emoji===emojiValue);if(existing)await supabase.from('message_reactions').delete().eq('message_id',message.id).eq('user_id',me).eq('emoji',emojiValue);else await supabase.from('message_reactions').insert({message_id:message.id,user_id:me,emoji:emojiValue});setMessageMenu(null);if(activeId)void loadMessages(activeId)}
+ async function starMessage(message:Message){const {error}=await supabase.from('starred_messages').insert({user_id:me,message_id:message.id});setNotice(error&&error.code!=='23505'?error.message:'Message saved to Starred Messages.');setMessageMenu(null)}
+ async function forwardMessage(targetId:string){if(!forwarding)return;const {error}=await supabase.from('messages').insert({conversation_id:targetId,sender_id:me,kind:forwarding.kind,body:forwarding.body,metadata:{...forwarding.metadata,forwarded:true}});if(error)setNotice(error.message);else setNotice('Message forwarded.');setForwarding(null);setMessageMenu(null)}
+ async function saveSticker(message:Message){try{let value=message.body;if(message.kind==='image'&&message.metadata?.path){const {data}=await supabase.storage.from('chat-media').createSignedUrl(String(message.metadata.path),120);if(!data?.signedUrl)throw new Error();const blob=await fetch(data.signedUrl).then(r=>r.blob());value=await new Promise<string>((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result));reader.onerror=()=>reject();reader.readAsDataURL(blob)})}const saved=JSON.parse(localStorage.getItem('nexa-custom-stickers')||'[]') as string[];localStorage.setItem('nexa-custom-stickers',JSON.stringify([value,...saved.filter(x=>x!==value)].slice(0,12)));setNotice('Sticker saved to your sticker tray.')}catch{setNotice('This sticker could not be saved.')}setMessageMenu(null)}
+ async function clearConversation(){if(!activeId)return;const {error}=await supabase.from('conversation_members').update({cleared_at:new Date().toISOString()}).eq('conversation_id',activeId).eq('user_id',me);if(error)setNotice(error.message);else setMessages([]);setChatInfo(false)}
+ async function deleteChat(){if(!activeId)return;const {error}=await supabase.from('conversation_members').delete().eq('conversation_id',activeId).eq('user_id',me);if(error)setNotice(error.message);else{setConversations(cs=>cs.filter(c=>c.id!==activeId));setActiveId(null);setMobileChat(false);setChatInfo(false)}}
+ async function sendEditedMedia(blob:Blob,name:string,caption:string){const mime=blob.type;const kind=mime.startsWith('image/')?'image':mime.startsWith('video/')?'video':mime.startsWith('audio/')?'audio':'file';setMediaFile(null);await uploadMedia(blob,kind,undefined,caption,name)}
+ async function sendLocation(){if(!activeId)return;setAttachMenu(false);if(!navigator.geolocation){setNotice('Location is not available on this device.');return}navigator.geolocation.getCurrentPosition(async p=>{const {latitude,longitude}=p.coords;const {error}=await supabase.from('messages').insert({conversation_id:activeId,sender_id:me,kind:'location',body:'Shared location',metadata:{latitude,longitude}});if(error)setNotice(error.message)},()=>setNotice('Location permission was denied.'),{enableHighAccuracy:true,timeout:12000})}
+ async function createPoll(question:string,options:string[],settings:Record<string,unknown>={}){if(!activeId)return;const {error}=await supabase.from('messages').insert({conversation_id:activeId,sender_id:me,kind:'text',body:question,metadata:{poll:{question,options,...settings,closed:false}}});if(error)setNotice(error.message);setPollModal(false)}
+ async function performChatAction(c:Conversation,action:string){const membership=()=>supabase.from('conversation_members');if(action==='archive'){await membership().update({archived:!c.memberInfo?.archived}).eq('conversation_id',c.id).eq('user_id',me);setConversations(cs=>cs.map(x=>x.id===c.id&&x.memberInfo?{...x,memberInfo:{...x.memberInfo,archived:!x.memberInfo.archived}}:x))}else if(action==='pin'){const pinned=!c.memberInfo?.pinned;await membership().update({pinned}).eq('conversation_id',c.id).eq('user_id',me);setConversations(cs=>cs.map(x=>x.id===c.id&&x.memberInfo?{...x,memberInfo:{...x.memberInfo,pinned}}:x).sort((a,b)=>Number(Boolean(b.memberInfo?.pinned))-Number(Boolean(a.memberInfo?.pinned))))}else if(action==='delete'){await membership().delete().eq('conversation_id',c.id).eq('user_id',me);setConversations(cs=>cs.filter(x=>x.id!==c.id));if(activeId===c.id){setActiveId(null);setMobileChat(false)}}else if(action==='unread'){await membership().update({last_read_at:'1970-01-01T00:00:00Z'}).eq('conversation_id',c.id).eq('user_id',me);setConversations(cs=>cs.map(x=>x.id===c.id&&x.memberInfo?{...x,memberInfo:{...x.memberInfo,last_read_at:'1970-01-01T00:00:00Z'}}:x))}else if(action==='read'){const now=new Date().toISOString();await membership().update({last_read_at:now}).eq('conversation_id',c.id).eq('user_id',me);setConversations(cs=>cs.map(x=>x.id===c.id&&x.memberInfo?{...x,memberInfo:{...x.memberInfo,last_read_at:now}}:x))}setChatAction(null)}
+ function startChatGesture(e:React.TouchEvent,c:Conversation){e.stopPropagation();const t=e.touches[0];chatGesture.current={x:t.clientX,y:t.clientY,chat:c};suppressChatClick.current=false;chatHold.current=setTimeout(()=>{suppressChatClick.current=true;setChatAction(c)},550)}
+ function endChatGesture(e:React.TouchEvent){e.stopPropagation();if(chatHold.current)clearTimeout(chatHold.current);const start=chatGesture.current;if(!start)return;const t=e.changedTouches[0],dx=t.clientX-start.x,dy=Math.abs(t.clientY-start.y);if(Math.abs(dx)>70&&dy<55){suppressChatClick.current=true;const action=localStorage.getItem(dx>0?'nexa-swipe-right':'nexa-swipe-left')||(dx>0?'read':'archive');void performChatAction(start.chat,action)}chatGesture.current=null}
+ async function createConference(kind:'voice'|'video',additional:string[]=[],openInvite=false){
+  if(!active)return
+  const id=crypto.randomUUID(),room=`Luma-${active.id.replaceAll('-','').slice(0,10)}-${crypto.randomUUID().replaceAll('-','').slice(0,14)}`,conferenceTitle=active.kind==='group'?(active.title||'Luma group'):`${profile?.display_name||'Luma'} conference`
+  const created=await supabase.from('conference_rooms').insert({id,room_code:room,conversation_id:active.id,created_by:me,kind,title:conferenceTitle});if(created.error){setNotice(created.error.message);return}
+  const participantIds=[...new Set([me,...(active.members||[]).map(p=>p.id),...additional])]
+  const invited=await supabase.from('conference_participants').insert(participantIds.map(user_id=>({room_id:id,user_id,invited_by:me,joined_at:user_id===me?new Date().toISOString():null})));if(invited.error){setNotice(invited.error.message);return}
+  await supabase.from('messages').insert({conversation_id:active.id,sender_id:me,kind:'call',body:`${kind==='video'?'Video':'Audio'} conference started`,metadata:{conference:true,conferenceId:id,room,callKind:kind,title:conferenceTitle}})
+  setConference({id,room,kind,title:conferenceTitle,createdBy:me,openInvite})
+ }
+ async function beginCall(kind:'voice'|'video'){
+  if(!active)return
+  if(active.kind==='group'){await createConference(kind);return}
+  if(kind==='video'&&PAYWALL_ENABLED&&!subscribed){setPaywall(true);return}
+  const p=peer(active);const id=crypto.randomUUID();const {error}=await supabase.from('call_sessions').insert({id,conversation_id:active.id,started_by:me,kind,state:'ringing'})
+  if(error){await handleCallError(error,kind);return}
+  setCall({id,kind,peer:p,incoming:false})
+ }
+ function acceptCall(){if(!incoming)return;const c=conversations.find(x=>x.id===incoming.conversation_id);if(!c)return;setCall({id:incoming.id,kind:incoming.kind,peer:peer(c),incoming:true});setIncoming(null)}
+ const filtered=useMemo(()=>conversations.filter(c=>title(c).toLowerCase().includes(query.toLowerCase())).filter(c=>section==='groups'?c.kind==='group':section==='chats').filter(c=>filter==='archived'?c.memberInfo?.archived:!c.memberInfo?.archived).filter(c=>filter!=='unread'||Boolean(c.last&&c.memberInfo&&c.last.sender_id!==me&&c.last.created_at>c.memberInfo.last_read_at)),[conversations,query,section,filter,me])
+
+ if(loading)return <div className="rt-loading"><LumaMark/><LoaderCircle/></div>
+ return <div className={`rt-app luma-ui ${dark?'rt-dark':''} theme-${theme} text-${fontSize} font-${fontFamily}`} onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd}>
+  {notice&&<div className="rt-notice"><span>{notice}</span><button onClick={()=>setNotice(null)}><X/></button></div>}
+  <nav className="rt-rail"><LumaMark className="rt-logo"/><button className={section==='chats'?'active':''} onClick={()=>{setSection('chats');setFilter('all');setMobileChat(false)}}><MessageCircle/><span>Chats</span></button><button className={section==='updates'?'active':''} onClick={()=>{setSection('updates');setMobileChat(false)}}><Radio/><span>Moments</span></button><button className={section==='calls'?'active':''} onClick={()=>{setSection('calls');setMobileChat(false)}}><Phone/><span>Calls</span></button><button className={section==='groups'?'active':''} onClick={()=>{setSection('groups');setFilter('all');setMobileChat(false)}}><Users/><span>Groups</span></button><div className="rt-rail-bottom"><button className={awake?'rt-awake-on':''} style={awake?{color:'#e7b94b'}:undefined} title={awake?'Keep awake: on':'Keep Luma awake in the background'} aria-label="Keep Luma awake in the background" onClick={toggleAwake}><Caffeine/></button><button className={notifyOn?'rt-notify-on':''} title={notifyOn?'Notifications on':'Enable notifications'} aria-label={notifyOn?'Disable notifications':'Enable notifications'} onClick={()=>notifyOn?disableNotifications():void enableNotifications()}>{notifyOn?<BellAlert/>:<BellOff/>}</button><button onClick={()=>setDark(!dark)}>{dark?<Sun/>:<Moon/>}</button><button onClick={()=>setSettings(true)}><Settings/></button><button className="rt-me" onClick={()=>setSettings(true)}>{initials(profile?.display_name||'Me')}</button></div></nav>
+  <aside className={`rt-sidebar ${mobileChat?'rt-mobile-hidden':''}`}><header><div><small>{section==='updates'?'STORIES & STATUS':section==='calls'?'RECENT ACTIVITY':'YOUR MESSAGES'}</small><h1>{section==='chats'?'Chats':section==='updates'?'Moments':section==='calls'?'Calls':'Groups'}</h1></div><button aria-label={section==='calls'?'Refresh call history':'New'} onClick={()=>section==='groups'?setGroupModal(true):section==='updates'?setSection('updates'):section==='calls'?void loadCalls():setNewChat(true)}>{section==='groups'?<Users/>:section==='updates'?<Radio/>:section==='calls'?<RefreshCw/>:<CirclePlus/>}</button></header>{section==='updates'?<UpdatesPanel profile={profile}/>:section==='calls'?<CallsPanel log={callLog} loading={callsLoading} me={me} conversations={conversations} onCall={callConversation} onOpen={id=>{setSection('chats');void openConversation(id)}}/>:<><div className="rt-search"><Search/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder={section==='groups'?'Search groups':'Search conversations'}/></div><div className="rt-filters"><button className={filter==='all'?'active':''} onClick={()=>setFilter('all')}>All</button><button className={filter==='unread'?'active':''} onClick={()=>setFilter('unread')}>Unread</button>{section==='chats'&&<button onClick={()=>{setSection('groups');setFilter('all')}}>Groups</button>}<button className={`archive-filter ${filter==='archived'?'active':''}`} onClick={()=>setFilter('archived')}><Archive/> Archived</button></div><div className="rt-list">{filtered.length?filtered.map(c=>{const p=peer(c);const unread=Boolean(c.last&&c.memberInfo&&c.last.sender_id!==me&&c.last.created_at>c.memberInfo.last_read_at);return <button key={c.id} className={activeId===c.id?'active':''} onContextMenu={e=>{e.preventDefault();setChatAction(c)}} onTouchStart={e=>startChatGesture(e,c)} onTouchEnd={endChatGesture} onTouchMove={e=>{if(chatGesture.current){const t=e.touches[0];if(Math.abs(t.clientY-chatGesture.current.y)>12&&chatHold.current)clearTimeout(chatHold.current)}}} onClick={()=>{if(suppressChatClick.current){suppressChatClick.current=false;return}void openConversation(c.id)}}><Avatar name={title(c)} url={c.avatar_url||p?.avatar_url}/><div><strong>{c.kind==='channel'&&<Hash/>}{title(c)}{c.memberInfo?.pinned&&<Pin/>}</strong><p>{c.last?.kind==='voice'?'🎙 Voice message':c.last?.body||c.description||'Start a conversation'}</p></div><time>{c.last?time(c.last.created_at):''}{unread&&<b/>}</time></button>}):<EmptyChats onClick={()=>section==='groups'?setGroupModal(true):setNewChat(true)}/>}{query.trim().length>=2&&<div className="rt-hits"><p className="rt-hits-label">{msgSearching?'Searching messages…':msgHits.length?`Messages (${msgHits.length})`:'No messages found'}</p>{msgHits.map(h=>{const conv=conversations.find(c=>c.id===h.conversation_id);const name=conv?title(conv):'Conversation';return <button key={h.id} className="rt-hit" onClick={()=>void jumpToMessage(h)}><Avatar name={name} url={conv?.avatar_url||(conv?peer(conv)?.avatar_url:null)}/><span><strong>{name}</strong><small>{h.body.slice(0,90)}</small></span><time>{time(h.created_at)}</time></button>})}</div>}</div></>}</aside>
+  <main className={`rt-conversation ${mobileChat?'rt-mobile-show':''}`}>{active?<><header><button className="rt-back" onClick={()=>setMobileChat(false)}><ChevronLeft/></button><button className="rt-contact-button" onClick={()=>setChatInfo(true)}><Avatar name={title(active)} url={active.avatar_url||peer(active)?.avatar_url}/><div className="rt-contact"><strong>{title(active)}</strong><small>{typing.length?`${typing.join(', ')} typing…`:active.kind==='group'?`${active.members?.length||0} members`:'online'}</small></div></button><div className="rt-actions"><button onClick={()=>beginCall('video')}><Video/></button><button onClick={()=>beginCall('voice')}><Phone/></button><button onClick={()=>{setChatSearch(!chatSearch);setChatQuery('')}}><Search/></button><button title="Archive conversation" onClick={()=>void toggleArchive()}><MoreVertical/></button></div></header>{chatSearch&&<div className="in-chat-search"><Search/><input autoFocus value={chatQuery} onChange={e=>setChatQuery(e.target.value)} placeholder="Search in this conversation"/><span>{messages.filter(m=>m.body.toLowerCase().includes(chatQuery.toLowerCase())).length} found</span><button onClick={()=>setChatSearch(false)}><X/></button></div>}<section className="rt-messages" style={wallpaper?{backgroundImage:wallpaper.startsWith('linear-gradient')?wallpaper:`linear-gradient(#00000012,#00000012),url(${wallpaper})`,backgroundSize:'cover',backgroundPosition:'center'}:undefined}><div className="rt-encryption"><LockKeyhole/> Messages and calls are protected in transit and visible only to conversation members. · Tip: swipe any message left or right to reply.</div><div className="rt-day"><span>Today</span></div>{messages.filter(m=>(!active.disappearing_seconds||(Date.now()-new Date(m.created_at).getTime())<active.disappearing_seconds*1000)&&(!chatQuery||m.body.toLowerCase().includes(chatQuery.toLowerCase()))).map((m,i)=><div key={m.id} id={`msg-${m.id}`} onClick={()=>setMessageMenu(m)} onTouchStart={e=>{const t=e.touches[0];msgSwipe.current={x:t.clientX,y:t.clientY,id:m.id}}} onTouchEnd={e=>{const s=msgSwipe.current;if(!s||s.id!==m.id)return;msgSwipe.current=null;const t=e.changedTouches[0],dx=t.clientX-s.x,dy=t.clientY-s.y;if(Math.abs(dx)>=36&&Math.abs(dy)<55&&Math.abs(dx)>=1.5*Math.abs(dy)){setEditing(null);setReplying(m)}}} className={`rt-bubble ${m.sender_id===me?'mine':'theirs'} kind-${m.kind} ${highlightId===m.id?'rt-flash':''}`}>{m.reply_to&&<div className="reply-quote"><strong>Reply</strong><span>{messages.find(x=>x.id===m.reply_to)?.body||'Original message'}</span></div>}{m.metadata?.conference?<ConferenceInvite message={m} onJoin={(id,room,kind)=>{void supabase.from('conference_participants').update({joined_at:new Date().toISOString(),dismissed_at:null}).eq('room_id',id).eq('user_id',me);setConference({id,room,kind,title:active.title||title(active)})}}/>:m.metadata?.poll?<PollMessage message={m} me={me}/>:(['voice','image','video','audio','file'].includes(m.kind))?<MediaMessage message={m}/>:m.kind==='location'?<a className="location-message" href={`https://maps.google.com/?q=${m.metadata?.latitude},${m.metadata?.longitude}`} target="_blank" onClick={e=>e.stopPropagation()}><MapPin/><span><strong>Shared location</strong><small>Open in Maps</small></span></a>:<p className={m.metadata?.sticker?'sticker-message':''}>{m.body}</p>}<span>{m.edited_at&&'edited · '}{time(m.created_at)}{m.sender_id===me&&<CheckCheck/>}</span>{reactions[m.id]?.length&&<div className="reaction-row">{Object.entries(reactions[m.id].reduce((a,r)=>({...a,[r.emoji]:(a[r.emoji]||0)+1}),{} as Record<string,number>)).map(([e,n])=><button key={e} onClick={ev=>{ev.stopPropagation();void reactTo(m,e)}}>{e} {n}</button>)}</div>}{m.sender_id!==me&&(i===0||messages[i-1]?.sender_id!==m.sender_id)&&<b>{active.members?.find(x=>x.id===m.sender_id)?.display_name}</b>}</div>)}<div ref={endRef}/></section><footer>{(replying||editing)&&<div className="composer-context"><div><strong>{editing?'Editing message':'Replying to message'}</strong><span>{(editing||replying)?.body}</span></div><button onClick={()=>{setReplying(null);setEditing(null);setDraft('')}}><X/></button></div>}{emoji&&<EmojiPicker onClose={()=>setEmoji(false)} onStickers={()=>{setEmoji(false);setStickers(true)}} onPick={e=>setDraft(draft+e)}/>} {stickers&&<StickerPicker onClose={()=>setStickers(false)} onEmoji={()=>{setStickers(false);setEmoji(true)}} onPick={sendSticker}/>} {attachMenu&&<div className="attachment-sheet"><button onClick={()=>fileInput.current?.click()}><FileUp/><span><strong>File or media</strong><small>Images, videos, audio, documents, ZIP and more</small></span></button><button onClick={()=>{setPollModal(true);setAttachMenu(false)}}><BarChart3/><span><strong>Poll</strong><small>Ask a question and collect votes</small></span></button><button onClick={()=>void sendLocation()}><MapPin/><span><strong>Location</strong><small>Share your current position</small></span></button></div>}<input ref={fileInput} hidden type="file" onChange={e=>{void chooseFile(e.target.files?.[0]);e.currentTarget.value=''}}/><input ref={videoInput} hidden type="file" accept="video/*" capture="environment" onChange={e=>{void chooseFile(e.target.files?.[0]);e.currentTarget.value=''}}/><button title="Attach files and more" className={attachMenu?'active':''} onClick={()=>{setAttachMenu(!attachMenu);setEmoji(false);setStickers(false)}}><Paperclip/></button><button title="Record video" onClick={()=>videoInput.current?.click()}><Camera/></button><button className={stickers?'active':''} onClick={()=>{setStickers(!stickers);setEmoji(false)}}><Sticker/></button><button className={emoji?'active':''} onClick={()=>{setEmoji(!emoji);setStickers(false)}}><Smile/></button>{recording?<div className="recording-bar"><i className={recordPaused?'paused':''}/><strong>{recordPaused?'Paused':'Recording'}</strong><span>{Math.floor(recordSeconds/60)}:{String(recordSeconds%60).padStart(2,'0')}</span><button className="record-pause" onClick={pauseRecording}>{recordPaused?<Play/>:<Pause/>}</button><small>Tap mic to send</small></div>:<textarea value={draft} onChange={e=>{setDraft(e.target.value);void typingChannel.current?.track({user_id:me,name:profile?.display_name,typing:Boolean(e.target.value)})}} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();void send()}}} placeholder="Write a message"/>}<button className={`${draft.trim()?'rt-send':''} ${recording?'recording':''}`} onClick={()=>draft.trim()?send():toggleRecording()}>{sending?<LoaderCircle className="spin"/>:draft.trim()?<Send/>:<Mic/>}</button></footer></>:<div className="rt-welcome"><LumaMark/><h2>Welcome to Luma</h2><p>Start a new private conversation and your messages will appear here instantly.</p><button onClick={()=>setNewChat(true)}><CirclePlus/> New conversation</button></div>}</main>
+  {newChat&&<div className="rt-modal"><div className="rt-newchat"><header><div><h2>New conversation</h2><p>Find someone by their name or username</p></div><button onClick={()=>setNewChat(false)}><X/></button></header><div className="rt-person-search"><Search/><input autoFocus value={peopleQuery} onChange={e=>void searchPeople(e.target.value)} placeholder="Type at least 2 characters"/>{searching&&<LoaderCircle className="spin"/>}</div><div className="rt-people">{people.map(p=><button key={p.id} disabled={Boolean(startingChat)} onClick={()=>startDirect(p)}><Avatar name={p.display_name} url={p.avatar_url}/><span><strong>{p.display_name}</strong><small>@{p.username} · {p.bio}</small></span>{startingChat===p.id&&<LoaderCircle className="spin"/>}</button>)}{peopleQuery.length<2&&<p>Search for a registered Luma user to begin chatting.</p>}{peopleQuery.length>=2&&!searching&&!people.length&&<p>No people found. Ask them to create a Luma account first.</p>}</div></div></div>}
+  {mediaFile&&<MediaEditor file={mediaFile} onClose={()=>setMediaFile(null)} onSend={(blob,name,caption)=>void sendEditedMedia(blob,name,caption)}/>} 
+  {pollModal&&<PollComposer onClose={()=>setPollModal(false)} onCreate={createPoll}/>} 
+  {paywall&&<Suspense fallback={null}><Paywall onClose={()=>setPaywall(false)} onNotice={m=>{setPaywall(false);setNotice(m)}}/></Suspense>}
+  {settings&&profile&&<SettingsPanel profile={profile} dark={dark} onDark={setDark} onUpdated={setProfile} onClose={()=>setSettings(false)} notifyOn={notifyOn} onToggleNotify={()=>notifyOn?disableNotifications():void enableNotifications()} soundsOn={soundsOn} onToggleSounds={()=>{const n=!soundsOn;localStorage.setItem('luma-sounds',n?'1':'0');setSoundsOn(n)}} awake={awake} onToggleAwake={toggleAwake}/>}
+  {chatInfo&&active&&<ChatInfoPanel conversation={active} peer={peer(active)} me={me} onClose={()=>setChatInfo(false)} onAudio={()=>{setChatInfo(false);void beginCall('voice')}} onVideo={()=>{setChatInfo(false);void beginCall('video')}} onSearch={()=>{setChatInfo(false);setChatSearch(true);setChatQuery('')}} onClear={()=>void clearConversation()} onDelete={()=>void deleteChat()} onArchive={()=>{void toggleArchive();setChatInfo(false)}} onTimer={seconds=>setConversations(cs=>cs.map(c=>c.id===active.id?{...c,disappearing_seconds:seconds}:c))}/>} 
+  {chatAction&&<div className="message-actions-backdrop" onClick={()=>setChatAction(null)}><div className="message-actions" onClick={e=>e.stopPropagation()}><div><strong>{title(chatAction)}</strong><button onClick={()=>setChatAction(null)}><X/></button></div><button onClick={()=>void performChatAction(chatAction,'archive')}><Archive/><span><strong>{chatAction.memberInfo?.archived?'Unarchive':'Archive'}</strong><small>Move this chat between your lists</small></span></button><button onClick={()=>void performChatAction(chatAction,'pin')}><Pin/><span><strong>{chatAction.memberInfo?.pinned?'Unpin chat':'Pin chat'}</strong><small>Keep important conversations at the top</small></span></button><button onClick={()=>void performChatAction(chatAction,'unread')}><MessageCircle/><span><strong>Mark unread</strong><small>Keep a reminder badge on this chat</small></span></button><button onClick={()=>void performChatAction(chatAction,'read')}><CheckCheck/><span><strong>Mark read</strong><small>Clear the unread indicator</small></span></button><button className="danger" onClick={()=>void performChatAction(chatAction,'delete')}><Trash2/><span><strong>Delete chat</strong><small>Remove this conversation from your account</small></span></button></div></div>}
+  {forwarding&&<div className="rt-modal"><div className="forward-modal"><header><div><h2>Forward message</h2><p>Choose a conversation</p></div><button onClick={()=>setForwarding(null)}><X/></button></header><div>{conversations.filter(c=>!c.memberInfo?.archived).map(c=><button key={c.id} onClick={()=>void forwardMessage(c.id)}><Avatar name={title(c)} url={c.avatar_url||peer(c)?.avatar_url}/><span><strong>{title(c)}</strong><small>{c.kind}</small></span><Forward/></button>)}</div></div></div>}
+  {messageMenu&&<div className="message-actions-backdrop" onClick={()=>setMessageMenu(null)}><div className="message-actions" onClick={e=>e.stopPropagation()}><div><strong>Message options</strong><button onClick={()=>setMessageMenu(null)}><X/></button></div><div className="quick-reactions">{['❤️','👍','😂','😮','😢','🙏'].map(e=><button key={e} onClick={()=>void reactTo(messageMenu,e)}>{e}</button>)}</div><button onClick={()=>{setReplying(messageMenu);setEditing(null);setMessageMenu(null)}}><Reply/><span><strong>Reply</strong><small>Quote this message in your response</small></span></button>{messageMenu.sender_id===me&&<button onClick={()=>{setEditing(messageMenu);setReplying(null);setDraft(messageMenu.body);setMessageMenu(null)}}><Pencil/><span><strong>Edit message</strong><small>Change text you have sent</small></span></button>}<button onClick={()=>{void navigator.clipboard.writeText(messageMenu.body);setNotice('Message copied.');setMessageMenu(null)}}><Copy/><span><strong>Copy</strong><small>Copy message text</small></span></button><button onClick={()=>{setForwarding(messageMenu);setMessageMenu(null)}}><Forward/><span><strong>Forward</strong><small>Send to another conversation</small></span></button><button onClick={()=>void starMessage(messageMenu)}><Star/><span><strong>Star message</strong><small>Save it for later</small></span></button>{Boolean(messageMenu.metadata?.sticker)&&<button onClick={()=>void saveSticker(messageMenu)}><Sticker/><span><strong>Save sticker</strong><small>Add or edit it from your sticker tray</small></span></button>}<button onClick={()=>void deleteMessageForMe(messageMenu)}><Trash2/><span><strong>Delete for me</strong><small>Remove only from this device/account</small></span></button>{messageMenu.sender_id===me&&<button className="danger" onClick={()=>void deleteMessageForAll(messageMenu)}><Trash2/><span><strong>Delete for everyone</strong><small>Remove for all conversation members</small></span></button>}</div></div>}
+  {groupModal&&<GroupModal me={me} onClose={()=>setGroupModal(false)} onCreated={id=>{setGroupModal(false);void loadConversations().then(()=>{setActiveId(id);setMobileChat(true);setSection('groups')})}}/>}
+  {incomingConference&&!conference&&<div className="incoming-call conference-alert"><div className="rt-avatar"><Users/></div><span><strong>Conference invitation</strong><small>{incomingConference.title} · {incomingConference.kind}</small></span><button className="decline" onClick={()=>{void supabase.from('conference_participants').update({dismissed_at:new Date().toISOString()}).eq('room_id',incomingConference.id).eq('user_id',me);setIncomingConference(null)}}><X/></button><button className="accept" onClick={()=>{void supabase.from('conference_participants').update({joined_at:new Date().toISOString()}).eq('room_id',incomingConference.id).eq('user_id',me);setConference(incomingConference);setIncomingConference(null)}}><Phone/></button></div>}
+  {incoming&&!call&&<div className="incoming-call"><Avatar name={conversations.find(c=>c.id===incoming.conversation_id)?title(conversations.find(c=>c.id===incoming.conversation_id)!):'Luma user'}/><span><strong>Incoming {incoming.kind} call</strong><small>Tap to answer</small></span><button className="decline" onClick={()=>{void supabase.from('call_sessions').update({state:'declined',ended_at:new Date().toISOString()}).eq('id',incoming.id);setIncoming(null)}}><Phone/></button><button className="accept" onClick={acceptCall}><Phone/></button></div>}
+  {call&&<WebRTCCall call={call} me={me} onClose={()=>setCall(null)} onConference={kind=>void createConference(kind,[],true)}/>} 
+  {conference&&<ConferenceRoom conference={conference} me={me} displayName={profile?.display_name||'Luma member'} onClose={()=>setConference(null)}/>} 
+ </div>
+}
+
+function ConferenceInvite({message,onJoin}:{message:Message;onJoin:(id:string,room:string,kind:'voice'|'video')=>void}){const id=String(message.metadata?.conferenceId||''),room=String(message.metadata?.room||''),kind=(message.metadata?.callKind==='voice'?'voice':'video') as 'voice'|'video';return <div className="conference-invite"><div>{kind==='video'?<Video/>:<Phone/>}</div><span><strong>{kind==='video'?'Video':'Audio'} conference</strong><small>Group room · tap to join</small></span><button onClick={e=>{e.stopPropagation();onJoin(id,room,kind)}}>Join</button></div>}
+function ConferenceRoom({conference,me,displayName,onClose}:{conference:Conference;me:string;displayName:string;onClose:()=>void}){const [inviteOpen,setInviteOpen]=useState(Boolean(conference.openInvite)),[query,setQuery]=useState(''),[people,setPeople]=useState<Profile[]>([]),[invited,setInvited]=useState<string[]>([]),[inviteError,setInviteError]=useState(''),[searchingPeople,setSearchingPeople]=useState(Boolean(conference.openInvite));useEffect(()=>{if(!inviteOpen)return;setSearchingPeople(true);const timer=setTimeout(async()=>{const req=supabase.from('profiles').select('*').neq('id',me).limit(40),q=query.trim();const {data,error}=q?await req.or(`display_name.ilike.%${q}%,username.ilike.%${q}%`):await req;if(error)setInviteError(error.message);setPeople((data||[]) as Profile[]);setSearchingPeople(false)},200);return()=>clearTimeout(timer)},[inviteOpen,query,me]);async function invite(person:Profile){setInviteError('');const {error}=await supabase.from('conference_participants').upsert({room_id:conference.id,user_id:person.id,invited_by:me,dismissed_at:null},{onConflict:'room_id,user_id'});if(error){setInviteError(error.message);return}setInvited(x=>[...new Set([...x,person.id])])}return <div className="conference-room livekit-room"><header><div><Users/><span><strong>{conference.title}</strong><small>{conference.kind==='video'?'Video':'Audio'} conference · {displayName}</small></span></div><div className="conference-header-actions"><button onClick={()=>setInviteOpen(true)} title="Add people"><UserPlus/></button><button onClick={onClose} title="Leave room"><X/></button></div></header><Suspense fallback={<div className="conference-loading"><LoaderCircle className="spin"/><strong>Preparing Luma conference…</strong></div>}><LiveKitConference roomId={conference.id} kind={conference.kind} onAddPeople={()=>setInviteOpen(true)} onLeave={onClose}/></Suspense><footer><ShieldCheck/> Embedded Luma conference · adaptive quality and per-user network strength</footer>{inviteOpen&&<div className="conference-invite-panel"><header><div><h2>Add people</h2><p>Invite any registered Luma user</p></div><button onClick={()=>setInviteOpen(false)}><X/></button></header><div className="conference-person-search"><Search/><input autoFocus value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search people"/></div>{inviteError&&<div className="conference-invite-error">{inviteError}</div>}<div className="conference-people">{searchingPeople&&<div className="conference-people-state"><LoaderCircle className="spin"/><span>Finding Luma users…</span></div>}{!searchingPeople&&!people.length&&<div className="conference-people-state"><Users/><span>No other registered users found.</span></div>}{people.map(p=><button key={p.id} disabled={invited.includes(p.id)} onClick={()=>void invite(p)}><Avatar name={p.display_name} url={p.avatar_url}/><span><strong>{p.display_name}</strong><small>@{p.username}</small></span><b>{invited.includes(p.id)?'Invited':'Invite'}</b></button>)}</div></div>}</div>}
+function PollComposer({onClose,onCreate}:{onClose:()=>void;onCreate:(q:string,o:string[],settings?:Record<string,unknown>)=>void}){const [question,setQuestion]=useState(''),[options,setOptions]=useState(['','']),[multiple,setMultiple]=useState(false),[anonymous,setAnonymous]=useState(false),[quiz,setQuiz]=useState(false),[correct,setCorrect]=useState(0),[explanation,setExplanation]=useState(''),[results,setResults]=useState('after_vote');const clean=options.map(x=>x.trim()).filter(Boolean);return <div className="rt-modal"><div className="poll-composer advanced"><header><div><h2>Create advanced poll</h2><p>Up to 12 choices · polls or quiz mode</p></div><button onClick={onClose}><X/></button></header><label>QUESTION<textarea autoFocus value={question} onChange={e=>setQuestion(e.target.value)} placeholder="Ask the group a question"/></label><div className="poll-mode"><button className={!quiz?'active':''} onClick={()=>setQuiz(false)}><BarChart3/> Poll</button><button className={quiz?'active':''} onClick={()=>{setQuiz(true);setMultiple(false)}}><ShieldCheck/> Quiz</button></div><div className="poll-options">{options.map((o,i)=><label key={i}>OPTION {i+1}{quiz&&o.trim()&&<button className={`correct-option ${correct===i?'active':''}`} onClick={()=>setCorrect(i)}>{correct===i?<CheckCheck/>:<CirclePlus/>}{correct===i?'Correct answer':'Mark correct'}</button>}<div><input value={o} maxLength={100} onChange={e=>setOptions(v=>v.map((x,j)=>j===i?e.target.value:x))} placeholder={`Choice ${i+1}`}/>{options.length>2&&<button onClick={()=>{setOptions(v=>v.filter((_,j)=>j!==i));if(correct>=i)setCorrect(Math.max(0,correct-1))}}><X/></button>}</div></label>)}</div>{options.length<12&&<button className="add-option" onClick={()=>setOptions(v=>[...v,''])}><CirclePlus/> Add another choice ({options.length}/12)</button>}{quiz&&<label className="quiz-explanation">ANSWER EXPLANATION<textarea value={explanation} onChange={e=>setExplanation(e.target.value)} placeholder="Explain the correct answer after voting (optional)"/></label>}<div className="poll-settings"><label><input type="checkbox" checked={multiple} disabled={quiz} onChange={e=>setMultiple(e.target.checked)}/><span><strong>Allow multiple answers</strong><small>People may select more than one choice</small></span></label><label><input type="checkbox" checked={anonymous} onChange={e=>setAnonymous(e.target.checked)}/><span><strong>Anonymous voting</strong><small>Hide voter identities from poll results</small></span></label><label><span><strong>Show results</strong><small>Choose when percentages become visible</small></span><select value={results} onChange={e=>setResults(e.target.value)}><option value="always">Immediately</option><option value="after_vote">After voting</option><option value="closed">After poll closes</option></select></label></div><footer><button onClick={onClose}>Cancel</button><button disabled={!question.trim()||clean.length<2||(quiz&&correct>=clean.length)} onClick={()=>onCreate(question.trim(),clean,{multiple,anonymous,quiz,correctOption:quiz?correct:null,explanation:quiz?explanation.trim():'',resultsVisibility:results})}>Create {quiz?'quiz':'poll'}</button></footer></div></div>}
+function StickerPicker({onPick,onClose,onEmoji}:{onPick:(s:string)=>void;onClose:()=>void;onEmoji:()=>void}){const defaults=['🫶','🥳','😂','😍','🔥','💯','🙌','😎','🤗','🤩','😴','🤯','🥹','👋','🎉','🚀','❤️','✨','💪','🙏'];const [custom,setCustom]=useState<string[]>(()=>{try{return JSON.parse(localStorage.getItem('nexa-custom-stickers')||'[]')}catch{return[]}});const input=useRef<HTMLInputElement>(null);function add(file?:File){if(!file||file.size>400000){return;}const r=new FileReader();r.onload=()=>{const next=[String(r.result),...custom].slice(0,12);setCustom(next);localStorage.setItem('nexa-custom-stickers',JSON.stringify(next))};r.readAsDataURL(file)}function remove(value:string){const next=custom.filter(x=>x!==value);setCustom(next);localStorage.setItem('nexa-custom-stickers',JSON.stringify(next))}return <div className="sticker-picker composer-tray"><header><div><button onClick={onEmoji}>Emoji</button><button className="active">Stickers</button></div><button onClick={onClose}><X/></button></header><input ref={input} hidden type="file" accept="image/*" onChange={e=>add(e.target.files?.[0])}/><button className="add-sticker" onClick={()=>input.current?.click()}><CirclePlus/> Add your own sticker</button><div>{custom.map((s,i)=><div className="custom-sticker" key={i}><button onClick={()=>onPick(s)}><img src={s}/></button><button onClick={()=>remove(s)}>×</button></div>)}{defaults.map((s,i)=><button key={i} onClick={()=>onPick(s)}><span>{s}</span></button>)}</div></div>}
+function Avatar({name,url}:{name:string;url?:string|null}){return <div className="rt-avatar" style={url?{backgroundImage:`url(${url})`}:{}}>{!url&&initials(name)}</div>}
+function CallsPanel({log,loading,me,conversations,onCall,onOpen}:{log:CallRecord[];loading:boolean;me:string;conversations:Conversation[];onCall:(c:Conversation,kind:'voice'|'video')=>void;onOpen:(id:string)=>void}){
+ const byId=useMemo(()=>{const m=new Map<string,Conversation>();conversations.forEach(c=>m.set(c.id,c));return m},[conversations])
+ const groups=useMemo(()=>{
+  const out:{label:string;items:CallRecord[]}[]=[]
+  const today=new Date();today.setHours(0,0,0,0)
+  const yesterday=new Date(today);yesterday.setDate(yesterday.getDate()-1)
+  for(const rec of log){
+   const d=new Date(rec.started_at)
+   const label=d>=today?'Today':d>=yesterday?'Yesterday':d.toLocaleDateString([],{day:'numeric',month:'long',year:d.getFullYear()===today.getFullYear()?undefined:'numeric'})
+   const last=out[out.length-1]
+   if(last&&last.label===label)last.items.push(rec);else out.push({label,items:[rec]})
+  }
+  return out
+ },[log])
+ function describe(rec:CallRecord){
+  const outgoing=rec.started_by===me
+  const missed=!rec.answered_at&&(rec.state==='declined'||rec.state==='ended'||rec.state==='missed')
+  let detail=time(rec.started_at)
+  if(missed)detail+=outgoing?' · No answer':' · Missed'
+  else if(rec.answered_at&&rec.ended_at){
+   const secs=Math.max(0,Math.round((new Date(rec.ended_at).getTime()-new Date(rec.answered_at).getTime())/1000))
+   const mm=Math.floor(secs/60),ss=secs%60
+   detail+=` · ${mm}:${String(ss).padStart(2,'0')}`
+  } else if(rec.state==='ringing')detail+=' · Ringing'
+  return {outgoing,missed,detail}
+ }
+ if(loading)return <div className="rt-calls"><div className="rt-calls-loading"><LoaderCircle/><span>Loading call history…</span></div></div>
+ if(!log.length)return <div className="rt-empty"><Phone/><strong>No calls yet</strong><p>Voice and video calls you make or receive will appear here.</p></div>
+ return <div className="rt-calls">{groups.map(g=><section key={g.label}><p className="rt-calls-day">{g.label}</p>{g.items.map(rec=>{
+  const conv=byId.get(rec.conversation_id)
+  const name=conv?(conv.kind!=='direct'?(conv.title||'Untitled'):(conv.members?.find(x=>x.id!==me)?.display_name||'Direct chat')):'Conversation'
+  const av=conv?.avatar_url||conv?.members?.find(x=>x.id!==me)?.avatar_url
+  const {outgoing,missed,detail}=describe(rec)
+  return <div key={rec.id} className={`rt-call-row ${missed?'missed':''}`}>
+   <button className="rt-call-main" onClick={()=>onOpen(rec.conversation_id)}>
+    <Avatar name={name} url={av}/>
+    <span><strong>{name}</strong><small>{missed?<PhoneMissed/>:outgoing?<PhoneOutgoing/>:<PhoneIncoming/>}{detail}</small></span>
+   </button>
+   <button className="rt-call-back" aria-label={`Call ${name}`} disabled={!conv} onClick={()=>conv&&onCall(conv,rec.kind)}>{rec.kind==='video'?<Video/>:<Phone/>}</button>
+  </div>
+ })}</section>)}</div>
+}
+
+function EmptyChats({onClick}:{onClick:()=>void}){return <div className="rt-empty"><MessageCircle/><strong>Your conversations live here</strong><p>Find another registered user and say hello.</p><button onClick={onClick}>Start a chat</button></div>}
+
+function WebRTCCall({call,me,onClose,onConference}:{call:{id:string;kind:'voice'|'video';peer:Profile;incoming:boolean};me:string;onClose:()=>void;onConference:(kind:'voice'|'video')=>void}){
+ const local=useRef<HTMLVideoElement>(null),remote=useRef<HTMLVideoElement>(null),pc=useRef<RTCPeerConnection|null>(null),stream=useRef<MediaStream|null>(null),channel=useRef<RealtimeChannel|null>(null)
+ const [status,setStatus]=useState(call.incoming?'Connecting…':'Calling…'),[muted,setMuted]=useState(false),[camera,setCamera]=useState(call.kind==='video'),[facing,setFacing]=useState<'user'|'environment'>('user'),[swapped,setSwapped]=useState(false)
+ useEffect(()=>{void setup();return()=>cleanup(false)},[])
+ async function setup(){try{
+  const media=await navigator.mediaDevices.getUserMedia({audio:true,video:call.kind==='video'?{facingMode:facing}:false});stream.current=media;if(local.current)local.current.srcObject=media
+  const peer=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}]});pc.current=peer;media.getTracks().forEach(t=>peer.addTrack(t,media));peer.ontrack=e=>{if(remote.current)remote.current.srcObject=e.streams[0]};peer.onconnectionstatechange=()=>{if(peer.connectionState==='connected')setStatus('Connected');if(['failed','disconnected'].includes(peer.connectionState))setStatus('Connection lost')};peer.onicecandidate=e=>{if(e.candidate)void signal('ice',e.candidate.toJSON())}
+  const ch=supabase.channel(`webrtc:${call.id}`).on('postgres_changes',{event:'INSERT',schema:'public',table:'call_signals',filter:`call_id=eq.${call.id}`},p=>void receive(p.new as any)).subscribe();channel.current=ch
+  await new Promise(r=>setTimeout(r,500))
+  if(call.incoming){const {data}=await supabase.from('call_signals').select('*').eq('call_id',call.id).order('created_at');for(const s of data||[])await receive(s)}
+  else{const offer=await peer.createOffer();await peer.setLocalDescription(offer);await signal('offer',offer)}
+ }catch(e){setStatus(e instanceof Error?e.message:'Camera or microphone permission was denied')}
+ }
+ async function signal(type:string,payload:unknown){await supabase.from('call_signals').insert({call_id:call.id,sender_id:me,signal_type:type,payload})}
+ async function receive(s:any){if(s.sender_id===me||!pc.current)return;try{if(s.signal_type==='offer'){await pc.current.setRemoteDescription(s.payload);const answer=await pc.current.createAnswer();await pc.current.setLocalDescription(answer);await signal('answer',answer);await supabase.from('call_sessions').update({state:'active',answered_at:new Date().toISOString()}).eq('id',call.id)}else if(s.signal_type==='answer'&&!pc.current.currentRemoteDescription){await pc.current.setRemoteDescription(s.payload)}else if(s.signal_type==='ice'&&pc.current.remoteDescription){await pc.current.addIceCandidate(s.payload)}else if(s.signal_type==='hangup')cleanup(false)}catch{/* Ignore duplicate realtime events. */}}
+ async function switchCamera(){try{const next=facing==='user'?'environment':'user';const fresh=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:next}},audio:false});const track=fresh.getVideoTracks()[0];const sender=pc.current?.getSenders().find(s=>s.track?.kind==='video');await sender?.replaceTrack(track);stream.current?.getVideoTracks().forEach(t=>t.stop());if(stream.current){stream.current.removeTrack(stream.current.getVideoTracks()[0]);stream.current.addTrack(track)}if(local.current)local.current.srcObject=stream.current;setFacing(next)}catch{setStatus('Could not switch camera')}}
+ function upgradeToConference(){void signal('hangup',{});stream.current?.getTracks().forEach(t=>t.stop());pc.current?.close();if(channel.current)void supabase.removeChannel(channel.current);void supabase.from('call_sessions').update({state:'ended',ended_at:new Date().toISOString()}).eq('id',call.id);onClose();onConference(call.kind)}
+ function cleanup(notify=true){if(notify)void signal('hangup',{});stream.current?.getTracks().forEach(t=>t.stop());pc.current?.close();if(channel.current)void supabase.removeChannel(channel.current);void supabase.from('call_sessions').update({state:'ended',ended_at:new Date().toISOString()}).eq('id',call.id);onClose()}
+ return <div className="rt-call"><div className="rt-call-card"><div className="rt-call-bg"/><video className={swapped?'rt-local-video':'rt-remote-video'} ref={remote} autoPlay playsInline onClick={()=>setSwapped(!swapped)}/><video className={swapped?'rt-remote-video':'rt-local-video'} ref={local} autoPlay muted playsInline onClick={()=>setSwapped(!swapped)}/><Avatar name={call.peer.display_name} url={call.peer.avatar_url}/><h2>{call.peer.display_name}</h2><p>{status}</p><div className="rt-call-controls"><button onClick={()=>{stream.current?.getAudioTracks().forEach(t=>t.enabled=!t.enabled);setMuted(!muted)}} className={muted?'off':''}><Mic/></button>{call.kind==='video'&&<button onClick={()=>{stream.current?.getVideoTracks().forEach(t=>t.enabled=!t.enabled);setCamera(!camera)}} className={!camera?'off':''}><Video/></button>}{call.kind==='video'&&<button onClick={switchCamera} title="Switch camera"><RefreshCw/></button>}<button onClick={upgradeToConference} title="Add participants"><UserPlus/></button><button className="hang" onClick={()=>cleanup()}><Phone/></button></div></div></div>
+}
